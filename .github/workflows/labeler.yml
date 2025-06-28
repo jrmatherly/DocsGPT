@@ -1,7 +1,7 @@
 # https://github.com/actions/labeler
 name: Pull Request Labeler
 permissions:
-  contents: read
+  contents: write
   issues: write
 on:
   - pull_request_target
@@ -9,7 +9,7 @@ jobs:
   triage:
     if: github.repository == 'jrmatherly/DocsGPT'
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
     runs-on: ubuntu-latest
     steps:
