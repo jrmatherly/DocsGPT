@@ -1,0 +1,256 @@
+name: docsgpt-oss
+
+networks:
+  docsgpt:
+    name: docsgpt
+    driver: bridge
+
+volumes:
+  mongodb_data:
+  redis_data:
+  qdrant_data:
+#  minio_data:
+
+services:
+
+  # ================= Frontend ================= #
+  frontend:
+    build: ../frontend
+    volumes:
+      - ../frontend/src:/app/src
+    environment:
+      - VITE_API_HOST=http://backend:7091 # Backend Container
+      - VITE_API_STREAMING=$VITE_API_STREAMING
+    networks:
+      - docsgpt
+    #  - proxy
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    labels:
+      # Traefik Enabled
+      - "traefik.enable=false"
+      # Entrypoints
+      - "traefik.http.routers.docsgpt-rtr.entrypoints=websecure" # HTTPS
+      # Routers
+      - "traefik.http.routers.docsgpt-rtr.rule=Host(`docsgpt.${DOMAIN_NAME}`)" # HTTPS
+      # Middlewares
+      - "traefik.http.routers.docsgpt-rtr.middlewares=chain-no-auth@file" # HTTPS (No Auth)
+      # Services
+      - "traefik.http.routers.docsgpt-rtr.service=docsgpt-svc" # HTTPS
+      # Load Balancers
+      - "traefik.http.services.docsgpt-svc.loadbalancer.server.port=5173" # HTTPS
+
+  # ================= Backend ================= #
+  backend:
+    user: root
+    build: ../application
+    environment:
+      - API_KEY=$API_KEY
+      - EMBEDDINGS_KEY=$API_KEY
+      - LLM_PROVIDER=$LLM_PROVIDER
+      - LLM_NAME=$LLM_NAME
+      - CELERY_BROKER_URL=$CELERY_BROKER_URL
+      - CELERY_RESULT_BACKEND=$CELERY_RESULT_BACKEND
+      - MONGO_URI=$MONGO_URI
+      - CACHE_REDIS_URL=$CACHE_REDIS_URL
+      - OPENAI_BASE_URL=$OPENAI_BASE_URL
+    networks:
+      - docsgpt
+    ports:
+      - "7091:7091"
+    volumes:
+      - ../application/indexes:/app/indexes
+      - ../application/inputs:/app/inputs
+      - ../application/vectors:/app/vectors
+    depends_on:
+      - docsgpt_redis
+      - docsgpt_mongodb
+      - docsgpt_qdrant
+
+  # ================= Worker ================= #
+  worker:
+    user: root
+    build: ../application
+    command: celery -A application.app.celery worker -l INFO -B
+    networks:
+      - docsgpt
+    environment:
+      - API_KEY=$API_KEY
+      - EMBEDDINGS_KEY=$API_KEY
+      - LLM_PROVIDER=$LLM_PROVIDER
+      - LLM_NAME=$LLM_NAME
+      - CELERY_BROKER_URL=$CELERY_BROKER_URL
+      - CELERY_RESULT_BACKEND=$CELERY_RESULT_BACKEND
+      - MONGO_URI=$MONGO_URI
+      - API_URL=http://backend:7091
+      - CACHE_REDIS_URL=$CACHE_REDIS_URL
+    volumes:
+      - ../application/indexes:/app/indexes
+      - ../application/inputs:/app/inputs
+      - ../application/vectors:/app/vectors
+    depends_on:
+      - docsgpt_redis
+      - docsgpt_mongodb
+      - docsgpt_qdrant
+
+  # ================= Redis ================= #
+  docsgpt_redis:
+    image: redis:8-alpine
+    container_name: docsgpt_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --tcp-keepalive 300
+    networks:
+      - docsgpt
+    expose:
+      - 6379
+    volumes:
+      - redis_data:/data
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ}
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping || exit 1"]
+
+  # ================= MongoDB ================= #
+  docsgpt_mongodb:
+    image: mongo:8.0.3
+    container_name: docsgpt_mongodb
+    restart: unless-stopped
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '50m'
+        max-file: '5'
+    networks:
+      - docsgpt
+    expose:
+      - 27017
+    volumes:
+      - mongodb_data:/data/db
+    #  - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - .env
+    environment:
+    #  - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
+      - MONGO_INITDB_DATABASE=${MONGO_INITDB_DATABASE}
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          "echo 'db.runCommand({ ping: 1 }).ok' | mongosh mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@127.0.0.1:27017/admin --quiet",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ================= Qdrant ================= #
+  docsgpt_qdrant:
+    image: qdrant/qdrant:latest
+    container_name: docsgpt_qdrant
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    networks:
+      - docsgpt
+    #  - proxy
+    expose:
+      - 6333/tcp
+      - 6334/tcp
+    volumes:
+      - qdrant_data:/qdrant/storage
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ}
+      QDRANT__LOG_LEVEL: ${QDRANT_LOG_LEVEL:-INFO}
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-01234567890}
+    labels:
+      # Traefik Enabled
+      - "traefik.enable=false"
+      # Entrypoints
+      - "traefik.http.routers.qdrant-rtr.entrypoints=websecure" # HTTPS
+      - "traefik.http.routers.qdrant-grpc-rtr.entrypoints=qdrant-grpc" # gRPC
+      # Routers
+      - "traefik.http.routers.qdrant-rtr.rule=Host(`qdrant.${DOMAIN_NAME}`)" # HTTPS
+      - "traefik.http.routers.qdrant-grpc-rtr.rule=Host(`qdrant.${DOMAIN_NAME}`)" # gRPC
+      # Middlewares
+      - "traefik.http.routers.qdrant-rtr.middlewares=chain-no-auth@file" # HTTPS (No Auth)
+      - "traefik.http.routers.qdrant-grpc-rtr.middlewares=chain-no-auth@file" # gRPC (No Auth)
+      # Services
+      - "traefik.http.routers.qdrant-rtr.service=qdrant-svc" # HTTPS
+      - "traefik.http.routers.qdrant-grpc-rtr.service=qdrant-grpc-svc" # gRPC
+      # Load Balancer
+      - "traefik.http.services.qdrant-svc.loadbalancer.server.port=6333" # HTTPS
+      - "traefik.http.services.qdrant-grpc-svc.loadbalancer.server.port=6334" # gRPC
+    healthcheck:
+      test: ["CMD-SHELL", "qdrant --version || exit 1"]
+
+# ============================================ #
+# ================= Optional ================= #
+# ============================================ #
+
+# ================= Minio ================= #
+# docsgpt_minio:
+#   image: minio/minio
+#   container_name: docsgpt_minio
+#   security_opt:
+#     - no-new-privileges:true
+#   restart: unless-stopped
+#   command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
+#   networks:
+#     docsgpt:
+#       aliases:
+#         - docsgpt_minio
+#   ports:
+#     - "9001:9001"
+#     - "9000:9000"
+#   volumes:
+#     - minio_data:/data
+#   environment:
+#     TZ: "${TZ}"
+#     MINIO_ROOT_USER: "${DOCSGPT_MINIO_ROOT_USER:-root}"
+#     MINIO_ROOT_PASSWORD: "${DOCSGPT_MINIO_ROOT_PASSWORD:-minio}"
+#     MINIO_REGION: "${DOCSGPT_MINIO_REGION:-us-east-1}"
+#     MINIO_ACCESS_KEY_ID: "${DOCSGPT_MINIO_ACCESS_KEY_ID:-access-key}"
+#     MINIO_SECRET_ACCESS_KEY: "${DOCSGPT_MINIO_SECRET_ACCESS_KEY:-secret-key}"
+#     MINIO_S3_ENDPOINT_URL: "${DOCSGPT_MINIO_S3_ENDPOINT_URL:-http://docsgpt_minio:9000}"
+#     MINIO_S3_BUCKET_NAME: "${DOCSGPT_MINIO_S3_BUCKET_NAME:-docsgpt}"
+
+# ================= Minio Create Bucket ================= #
+#  docsgpt_mc:
+#    image: minio/mc
+#    container_name: docsgpt_mc
+#    security_opt:
+#      - no-new-privileges:true
+#    restart: no
+#    networks:
+#      docsgpt:
+#    environment:
+#      TZ: "${TZ}"
+#      AWS_ACCESS_KEY_ID: "${DOCSGPT_MINIO_ACCESS_KEY_ID}"
+#      AWS_SECRET_ACCESS_KEY: "${DOCSGPT_MINIO_SECRET_ACCESS_KEY}"
+#      AWS_REGION: "${DOCSGPT_MINIO_REGION}"
+#    entrypoint: >
+#      /bin/sh -c "
+#      until (/usr/bin/mc config host add docsgpt_minio http://docsgpt_minio:9000 ${DOCSGPT_MINIO_ACCESS_KEY_ID} ${DOCSGPT_MINIO_SECRET_ACCESS_KEY}) do echo '...waiting...' && sleep 1; done;
+#      /usr/bin/mc rm -r --force docsgpt_minio/docsgpt;
+#      /usr/bin/mc mb docsgpt_minio/docsgpt;
+#      tail -f /dev/null
+#      "
+#    depends_on:
+#      - docsgpt_minio

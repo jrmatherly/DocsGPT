@@ -1,0 +1,15 @@
+services:
+  redis:
+    image: redis:8-alpine
+    ports:
+      - 6379:6379
+
+  mongo:
+    image: mongo:8
+    ports:
+      - 27017:27017
+    volumes:
+      - mongodb_data_container:/data/db
+
+volumes:
+  mongodb_data_container:
